@@ -5,7 +5,7 @@
 A single binary that runs in your terminal, watches your dev environment, and does things without being asked.
 
 ```sh
-curl -fsSL https://get.agentd.dev | sh && agentd init
+curl -fsSL https://raw.githubusercontent.com/moesaif/agentd/main/install.sh | sh && agentd init
 ```
 
 <!-- TODO: Replace with terminal recording GIF -->
@@ -34,7 +34,7 @@ Most AI dev tools are chatbots — you talk to them, they respond. **agentd is t
 
 ```sh
 # Install
-curl -fsSL https://get.agentd.dev | sh
+curl -fsSL https://raw.githubusercontent.com/moesaif/agentd/main/install.sh | sh
 
 # Setup (detects API keys from env, installs bundled skills)
 agentd init
