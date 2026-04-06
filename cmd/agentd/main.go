@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +26,7 @@ import (
 	"github.com/moesaif/agentd/internal/llm"
 	"github.com/moesaif/agentd/internal/mcp"
 	"github.com/moesaif/agentd/internal/skills"
+	"github.com/moesaif/agentd/internal/tui"
 	"github.com/moesaif/agentd/internal/watchers"
 )
 
@@ -37,6 +42,8 @@ func main() {
 	root.AddCommand(
 		startCmd(),
 		stopCmd(),
+		updateCmd(),
+		uninstallCmd(),
 		statusCmd(),
 		skillsCmd(),
 		historyCmd(),
@@ -49,6 +56,19 @@ func main() {
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+const (
+	githubRepoOwner = "moesaif"
+	githubRepoName  = "agentd"
+)
+
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
 }
 
 func loadConfig() config.Config {
@@ -243,6 +263,149 @@ func stopCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func updateCmd() *cobra.Command {
+	var checkOnly bool
+
+	cmd := &cobra.Command{
+		Use:   "update",
+		Short: "Update agentd to the latest release",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			release, err := fetchLatestRelease(cmd.Context())
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Current version: %s\n", version)
+			fmt.Printf("Latest version:  %s\n", release.TagName)
+
+			if version != "dev" && version == release.TagName {
+				fmt.Println("agentd is already up to date.")
+				return nil
+			}
+
+			if checkOnly {
+				return nil
+			}
+
+			assetName := releaseAssetName()
+			downloadURL := releaseAssetURL(release, assetName)
+			if downloadURL == "" {
+				return fmt.Errorf("no release asset found for %s", assetName)
+			}
+
+			exePath, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("locating current executable: %w", err)
+			}
+			exePath, err = filepath.EvalSymlinks(exePath)
+			if err != nil {
+				// If symlink resolution fails, still try the raw executable path.
+				exePath, _ = os.Executable()
+			}
+
+			if runtime.GOOS == "windows" {
+				targetPath := exePath + ".new"
+				if err := downloadBinary(cmd.Context(), downloadURL, targetPath); err != nil {
+					return err
+				}
+				fmt.Printf("Downloaded update to %s\n", targetPath)
+				fmt.Println("Windows cannot replace a running binary in-place.")
+				fmt.Println("Close agentd and replace the existing executable with the .new file.")
+				return nil
+			}
+
+			tmpPath := exePath + ".tmp"
+			if err := downloadBinary(cmd.Context(), downloadURL, tmpPath); err != nil {
+				return err
+			}
+			defer os.Remove(tmpPath)
+
+			if err := os.Rename(tmpPath, exePath); err != nil {
+				return fmt.Errorf("replacing %s failed: %w\nTry re-running with elevated permissions or reinstall via the install script", exePath, err)
+			}
+
+			fmt.Printf("Updated agentd to %s\n", release.TagName)
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&checkOnly, "check", false, "Only check whether an update is available")
+	return cmd
+}
+
+func uninstallCmd() *cobra.Command {
+	var assumeYes bool
+	var keepState bool
+
+	cmd := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove agentd from this machine",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := loadConfig()
+
+			if !assumeYes {
+				fmt.Println("This will remove the agentd executable.")
+				if keepState {
+					fmt.Println("Your state directory will be kept.")
+				} else {
+					fmt.Printf("Your state directory will be removed: %s\n", cfg.StateDir())
+				}
+
+				if isInteractiveSession() {
+					reader := bufio.NewReader(os.Stdin)
+					ok, err := promptYesNo(reader, "Continue", false)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						fmt.Println("Uninstall cancelled.")
+						return nil
+					}
+				} else {
+					return fmt.Errorf("refusing to uninstall without confirmation; re-run with --yes")
+				}
+			}
+
+			_ = stopAgentProcess(cfg)
+
+			if !keepState {
+				if err := os.RemoveAll(cfg.StateDir()); err != nil {
+					return fmt.Errorf("removing state directory %s: %w", cfg.StateDir(), err)
+				}
+				fmt.Printf("Removed state directory %s\n", cfg.StateDir())
+			}
+
+			exePath, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("locating current executable: %w", err)
+			}
+			exePath, err = filepath.EvalSymlinks(exePath)
+			if err != nil {
+				exePath, _ = os.Executable()
+			}
+
+			if runtime.GOOS == "windows" {
+				fmt.Printf("agentd executable is at %s\n", exePath)
+				fmt.Println("Windows does not allow a running process to delete itself.")
+				fmt.Println("Delete the executable manually after this command exits.")
+				return nil
+			}
+
+			if err := os.Remove(exePath); err != nil {
+				return fmt.Errorf("removing executable %s failed: %w\nTry re-running with elevated permissions", exePath, err)
+			}
+
+			fmt.Printf("Removed executable %s\n", exePath)
+			fmt.Println("agentd has been uninstalled.")
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVarP(&assumeYes, "yes", "y", false, "Skip confirmation")
+	cmd.Flags().BoolVar(&keepState, "keep-state", false, "Keep ~/.agentd state and config files")
+	return cmd
 }
 
 func statusCmd() *cobra.Command {
@@ -527,8 +690,6 @@ func initCmd() *cobra.Command {
 		Use:   "init",
 		Short: "Interactive setup wizard",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := config.DefaultConfig()
-
 			fmt.Println()
 			fmt.Println("  ╔══════════════════════════════════════╗")
 			fmt.Println("  ║          Welcome to agentd!          ║")
@@ -536,65 +697,296 @@ func initCmd() *cobra.Command {
 			fmt.Println("  ╚══════════════════════════════════════╝")
 			fmt.Println()
 
-			// Check for existing config
-			if _, err := os.Stat(cfg.ConfigPath()); err == nil {
-				fmt.Println("  Config already exists at", cfg.ConfigPath())
-				fmt.Println("  Run 'agentd start' to begin.")
-				return nil
+			if !isInteractiveSession() {
+				return runNonInteractiveInit()
 			}
 
-			// Check for API key in environment
-			if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-				cfg.LLM.Provider = "anthropic"
-				cfg.LLM.APIKey = "${ANTHROPIC_API_KEY}"
-				fmt.Println("  ✓ Found ANTHROPIC_API_KEY in environment")
-			} else if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-				cfg.LLM.Provider = "openai"
-				cfg.LLM.APIKey = "${OPENAI_API_KEY}"
-				cfg.LLM.Model = "gpt-4o"
-				fmt.Println("  ✓ Found OPENAI_API_KEY in environment")
-			} else {
-				fmt.Println("  ! No API key found in environment.")
-				fmt.Println("    Set ANTHROPIC_API_KEY or OPENAI_API_KEY, then re-run.")
-				fmt.Println("    Or configure manually in ~/.agentd/config.yaml")
-				fmt.Println()
-			}
-
-			// Create directories
-			if err := config.EnsureDirs(cfg); err != nil {
-				return err
-			}
-			fmt.Println("  ✓ Created", cfg.StateDir())
-			fmt.Println("  ✓ Created", cfg.SkillsDir())
-
-			// Copy bundled skills
-			bundledDir := findBundledSkillsDir()
-			if bundledDir != "" {
-				copied := copyBundledSkills(bundledDir, cfg.SkillsDir())
-				if copied > 0 {
-					fmt.Printf("  ✓ Installed %d bundled skills\n", copied)
-				}
-			}
-
-			// Save config
-			if err := cfg.Save(cfg.ConfigPath()); err != nil {
-				return err
-			}
-			fmt.Println("  ✓ Config saved to", cfg.ConfigPath())
-
-			fmt.Println()
-			fmt.Println("  You're all set! Run 'agentd start' to begin.")
-			fmt.Println()
-			fmt.Println("  Quick tips:")
-			fmt.Println("    agentd start          Start watching (foreground)")
-			fmt.Println("    agentd start -d       Start as daemon")
-			fmt.Println("    agentd skills         List available skills")
-			fmt.Println("    agentd status         Check status")
-			fmt.Println()
-
-			return nil
+			return runInteractiveInit()
 		},
 	}
+}
+
+func runNonInteractiveInit() error {
+	cfg := config.DefaultConfig()
+	if _, err := os.Stat(cfg.ConfigPath()); err == nil {
+		fmt.Println("  Config already exists at", cfg.ConfigPath())
+		fmt.Println("  Run 'agentd init' in a terminal to reconfigure, or edit the file manually.")
+		return nil
+	}
+
+	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+		cfg.LLM.Provider = "anthropic"
+		cfg.LLM.APIKey = "${ANTHROPIC_API_KEY}"
+		fmt.Println("  ✓ Found ANTHROPIC_API_KEY in environment")
+	} else if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+		cfg.LLM.Provider = "openai"
+		cfg.LLM.APIKey = "${OPENAI_API_KEY}"
+		cfg.LLM.Model = "gpt-4o"
+		fmt.Println("  ✓ Found OPENAI_API_KEY in environment")
+	} else {
+		fmt.Println("  ! No API key found in environment.")
+		fmt.Println("    Run 'agentd init' in an interactive terminal to set one now.")
+		fmt.Println("    Or configure ~/.agentd/config.yaml manually.")
+		fmt.Println()
+	}
+
+	if err := config.EnsureDirs(cfg); err != nil {
+		return err
+	}
+	fmt.Println("  ✓ Created", cfg.StateDir())
+	fmt.Println("  ✓ Created", cfg.SkillsDir())
+
+	bundledDir := findBundledSkillsDir()
+	if bundledDir != "" {
+		copied := copyBundledSkills(bundledDir, cfg.SkillsDir())
+		if copied > 0 {
+			fmt.Printf("  ✓ Installed %d bundled skills\n", copied)
+		}
+	}
+
+	if err := cfg.Save(cfg.ConfigPath()); err != nil {
+		return err
+	}
+	fmt.Println("  ✓ Config saved to", cfg.ConfigPath())
+	fmt.Println()
+	fmt.Println("  You're all set! Run 'agentd start' to begin.")
+	return nil
+}
+
+func runInteractiveInit() error {
+	cfg := config.DefaultConfig()
+	cfgPath := cfg.ConfigPath()
+	hasExistingConfig := false
+
+	if _, err := os.Stat(cfgPath); err == nil {
+		hasExistingConfig = true
+		existing, loadErr := config.Load(cfgPath)
+		if loadErr == nil {
+			cfg = existing
+		}
+	}
+
+	if err := config.EnsureDirs(cfg); err != nil {
+		return err
+	}
+
+	result, err := tui.RunInitWizard(cfg, hasExistingConfig)
+	if err != nil {
+		return err
+	}
+	if result.Cancelled {
+		fmt.Println("  Setup cancelled.")
+		return nil
+	}
+	cfg = result.Config
+
+	bundledDir := findBundledSkillsDir()
+	if bundledDir != "" {
+		copied := copyBundledSkills(bundledDir, cfg.SkillsDir())
+		if copied > 0 {
+			fmt.Printf("  ✓ Installed %d bundled skills\n", copied)
+		} else {
+			fmt.Println("  ✓ Bundled skills already present")
+		}
+	}
+
+	if err := cfg.Save(cfgPath); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Println("  Setup complete")
+	fmt.Println("  --------------")
+	fmt.Println("  Config:", cfgPath)
+	fmt.Printf("  Provider: %s\n", describeProvider(cfg))
+	if cfg.MCP.Enabled {
+		fmt.Printf("  MCP: http://localhost:%d/mcp\n", cfg.MCP.Port)
+	}
+	if cfg.Watchers.Webhook.Enabled {
+		fmt.Printf("  Webhook: http://localhost:%d/webhook\n", cfg.Watchers.Webhook.Port)
+	}
+
+	if needsAPIKeyHint(cfg) {
+		fmt.Println()
+		fmt.Println("  No API key configured yet.")
+		if cfg.LLM.Provider == "anthropic" {
+			fmt.Println("  Export one later with:")
+			fmt.Println("    export ANTHROPIC_API_KEY=your-key")
+		} else if cfg.LLM.Provider == "openai" {
+			fmt.Println("  Export one later with:")
+			fmt.Println("    export OPENAI_API_KEY=your-key")
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("  Next steps:")
+	fmt.Println("    agentd start          Start watching in the foreground")
+	fmt.Println("    agentd start -d       Start as a background process")
+	fmt.Println("    agentd skills         See what is installed")
+	fmt.Println("    agentd status         Check recent events and actions")
+	fmt.Println()
+
+	return nil
+}
+
+func isInteractiveSession() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func promptYesNo(reader *bufio.Reader, label string, defaultYes bool) (bool, error) {
+	defaultValue := "y/N"
+	if defaultYes {
+		defaultValue = "Y/n"
+	}
+	for {
+		fmt.Printf("%s [%s]: ", label, defaultValue)
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			return false, err
+		}
+		input = strings.ToLower(strings.TrimSpace(input))
+		if input == "" {
+			return defaultYes, nil
+		}
+		if input == "y" || input == "yes" {
+			return true, nil
+		}
+		if input == "n" || input == "no" {
+			return false, nil
+		}
+		fmt.Println("  Enter y or n.")
+	}
+}
+
+func describeProvider(cfg config.Config) string {
+	switch cfg.LLM.Provider {
+	case "anthropic", "openai":
+		if cfg.LLM.APIKey == "" {
+			return fmt.Sprintf("%s (%s, no key configured)", cfg.LLM.Provider, cfg.LLM.Model)
+		}
+		if strings.HasPrefix(cfg.LLM.APIKey, "${") {
+			return fmt.Sprintf("%s (%s, via env)", cfg.LLM.Provider, cfg.LLM.Model)
+		}
+		return fmt.Sprintf("%s (%s, stored in config)", cfg.LLM.Provider, cfg.LLM.Model)
+	case "ollama":
+		return fmt.Sprintf("ollama (%s via %s)", cfg.LLM.Model, cfg.LLM.BaseURL)
+	default:
+		return "not configured"
+	}
+}
+
+func needsAPIKeyHint(cfg config.Config) bool {
+	return (cfg.LLM.Provider == "anthropic" || cfg.LLM.Provider == "openai") && cfg.LLM.APIKey == ""
+}
+
+func fetchLatestRelease(ctx context.Context) (githubRelease, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", githubRepoOwner, githubRepoName), nil)
+	if err != nil {
+		return githubRelease{}, fmt.Errorf("creating release request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "agentd/"+version)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return githubRelease{}, fmt.Errorf("fetching latest release: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return githubRelease{}, fmt.Errorf("GitHub API returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var release githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return githubRelease{}, fmt.Errorf("decoding release metadata: %w", err)
+	}
+	if release.TagName == "" {
+		return githubRelease{}, fmt.Errorf("latest release metadata was missing a tag name")
+	}
+	return release, nil
+}
+
+func releaseAssetName() string {
+	name := fmt.Sprintf("agentd-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
+func releaseAssetURL(release githubRelease, assetName string) string {
+	for _, asset := range release.Assets {
+		if asset.Name == assetName {
+			return asset.BrowserDownloadURL
+		}
+	}
+	return ""
+}
+
+func downloadBinary(ctx context.Context, url, targetPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("creating download request: %w", err)
+	}
+	req.Header.Set("User-Agent", "agentd/"+version)
+
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("downloading update: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("download failed with %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("creating %s: %w", targetPath, err)
+	}
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return fmt.Errorf("writing %s: %w", targetPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing %s: %w", targetPath, err)
+	}
+
+	return nil
+}
+
+func stopAgentProcess(cfg config.Config) error {
+	data, err := os.ReadFile(cfg.PIDPath())
+	if err != nil {
+		return nil
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return nil
+	}
+
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return nil
+	}
+
+	_ = os.Remove(cfg.PIDPath())
+	return nil
 }
 
 func printBanner(cfg config.Config) {
@@ -704,4 +1096,3 @@ func truncate(s string, max int) string {
 	}
 	return s[:max-3] + "..."
 }
-

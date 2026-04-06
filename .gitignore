@@ -3,3 +3,8 @@ dist/
 *.db
 *.log
 .DS_Store
+.vscode/
+.idea/
+.claude/
+.gocache/
+.gomodcache/

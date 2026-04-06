@@ -182,6 +182,8 @@ mcp:
 agentd start              # start (foreground)
 agentd start -d           # start as daemon
 agentd stop               # stop daemon
+agentd update             # update to the latest release
+agentd uninstall          # remove agentd from this machine
 agentd status             # show status + recent events
 agentd skills             # list loaded skills
 agentd skills run <name>  # manually trigger a skill
