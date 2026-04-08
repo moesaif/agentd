@@ -16,11 +16,30 @@ type OpenAIClient struct {
 	baseURL string
 }
 
+type openaiToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type openaiTool struct {
+	Type     string              `json:"type"`
+	Function openaiToolFunction  `json:"function"`
+}
+
+type openaiToolCall struct {
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type openaiRequest struct {
 	Model       string          `json:"model"`
 	Messages    []openaiMessage `json:"messages"`
 	MaxTokens   int             `json:"max_tokens,omitempty"`
 	Temperature float64         `json:"temperature"`
+	Tools       []openaiTool    `json:"tools,omitempty"`
 }
 
 type openaiMessage struct {
@@ -31,7 +50,8 @@ type openaiMessage struct {
 type openaiResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content   string           `json:"content"`
+			ToolCalls []openaiToolCall `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
@@ -61,6 +81,21 @@ func (c *OpenAIClient) Complete(ctx context.Context, req CompletionRequest) (Com
 		Messages:    messages,
 		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
+	}
+
+	if len(req.Tools) > 0 {
+		tools := make([]openaiTool, len(req.Tools))
+		for i, t := range req.Tools {
+			tools[i] = openaiTool{
+				Type: "function",
+				Function: openaiToolFunction{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  t.Parameters,
+				},
+			}
+		}
+		body.Tools = tools
 	}
 
 	data, err := json.Marshal(body)
@@ -101,8 +136,20 @@ func (c *OpenAIClient) Complete(ctx context.Context, req CompletionRequest) (Com
 		return CompletionResponse{}, fmt.Errorf("no choices in response")
 	}
 
+	msg := result.Choices[0].Message
+	var toolCalls []ToolCall
+	for _, tc := range msg.ToolCalls {
+		var input map[string]any
+		_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		toolCalls = append(toolCalls, ToolCall{
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+
 	return CompletionResponse{
-		Content:    result.Choices[0].Message.Content,
+		Content:    msg.Content,
+		ToolCalls:  toolCalls,
 		TokensUsed: result.Usage.TotalTokens,
 	}, nil
 }

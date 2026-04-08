@@ -28,6 +28,7 @@ import (
 	"github.com/moesaif/agentd/internal/skills"
 	"github.com/moesaif/agentd/internal/tui"
 	"github.com/moesaif/agentd/internal/watchers"
+	"github.com/moesaif/agentd/internal/web"
 )
 
 var version = "dev"
@@ -45,6 +46,8 @@ func main() {
 		updateCmd(),
 		uninstallCmd(),
 		statusCmd(),
+		chatCmd(),
+		webCmd(),
 		skillsCmd(),
 		historyCmd(),
 		memoryCmd(),
@@ -408,6 +411,95 @@ func uninstallCmd() *cobra.Command {
 	return cmd
 }
 
+func webCmd() *cobra.Command {
+	var port int
+
+	cmd := &cobra.Command{
+		Use:   "web",
+		Short: "Start the web UI",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := loadConfig()
+			setupLogging(cfg.Agent.LogLevel)
+
+			if err := config.EnsureDirs(cfg); err != nil {
+				return err
+			}
+
+			store, err := db.Open(cfg.DBPath())
+			if err != nil {
+				return fmt.Errorf("opening database: %w", err)
+			}
+			defer store.Close()
+
+			var llmClient llm.Client
+			if cfg.LLM.APIKey != "" {
+				llmClient, err = llm.NewClient(cfg.LLM)
+				if err != nil {
+					log.Warn("LLM unavailable", "error", err)
+				}
+			}
+
+			bundledDir := findBundledSkillsDir()
+			loadedSkills, _ := skills.LoadAll(cfg.SkillsDir(), bundledDir)
+
+			srv := web.New(port, cfg, store, llmClient, loadedSkills)
+			if err := srv.Start(); err != nil {
+				return fmt.Errorf("starting web server: %w", err)
+			}
+
+			fmt.Println(tui.RenderKeyValueCard("agentd web UI", []tui.KeyValue{
+				{Label: "URL", Value: fmt.Sprintf("http://localhost:%d", port)},
+				{Label: "Provider", Value: describeProvider(cfg)},
+				{Label: "Skills", Value: fmt.Sprintf("%d loaded", len(loadedSkills))},
+			}))
+			fmt.Println(tui.Muted("Press Ctrl+C to stop"))
+
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+			<-sig
+
+			srv.Stop()
+			return nil
+		},
+	}
+	cmd.Flags().IntVarP(&port, "port", "p", 7779, "Port to listen on")
+	return cmd
+}
+
+func chatCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "chat",
+		Short: "Interactive chat with agentd",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := loadConfig()
+			setupLogging("error") // suppress logs inside the TUI
+
+			if err := config.EnsureDirs(cfg); err != nil {
+				return err
+			}
+
+			store, err := db.Open(cfg.DBPath())
+			if err != nil {
+				return fmt.Errorf("opening database: %w", err)
+			}
+			defer store.Close()
+
+			var llmClient llm.Client
+			if cfg.LLM.APIKey != "" {
+				llmClient, err = llm.NewClient(cfg.LLM)
+				if err != nil {
+					log.Warn("LLM unavailable", "error", err)
+				}
+			}
+
+			bundledDir := findBundledSkillsDir()
+			loadedSkills, _ := skills.LoadAll(cfg.SkillsDir(), bundledDir)
+
+			return tui.RunChat(cfg, llmClient, loadedSkills, store)
+		},
+	}
+}
+
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
@@ -423,7 +515,6 @@ func statusCmd() *cobra.Command {
 			}
 
 			pid := strings.TrimSpace(string(data))
-			fmt.Printf("agentd is running (PID %s)\n\n", pid)
 
 			// Show recent events
 			store, err := db.Open(cfg.DBPath())
@@ -433,20 +524,26 @@ func statusCmd() *cobra.Command {
 			defer store.Close()
 
 			events, _ := store.RecentEvents(5)
-			if len(events) > 0 {
-				fmt.Println("Recent events:")
-				for _, e := range events {
-					fmt.Printf("  [%s] %s.%s\n", e.CreatedAt.Format("15:04:05"), e.Source, e.Type)
-				}
+			var eventLines []string
+			for _, e := range events {
+				eventLines = append(eventLines, fmt.Sprintf("[%s] %s.%s", e.CreatedAt.Format("15:04:05"), e.Source, e.Type))
 			}
 
 			actions, _ := store.RecentActions(5)
-			if len(actions) > 0 {
-				fmt.Println("\nRecent actions:")
-				for _, a := range actions {
-					fmt.Printf("  [%s] %s → %s (%s)\n", a.CreatedAt.Format("15:04:05"), a.SkillName, a.ActionType, a.Status)
-				}
+			var actionLines []string
+			for _, a := range actions {
+				actionLines = append(actionLines, fmt.Sprintf("[%s] %s -> %s (%s)", a.CreatedAt.Format("15:04:05"), a.SkillName, a.ActionType, a.Status))
 			}
+
+			fmt.Println(tui.RenderStack(
+				tui.RenderKeyValueCard("agentd status", []tui.KeyValue{
+					{Label: "Status", Value: "running"},
+					{Label: "PID", Value: pid},
+					{Label: "State", Value: cfg.StateDir()},
+				}),
+				tui.RenderListCard("Recent events", eventLines),
+				tui.RenderListCard("Recent actions", actionLines),
+			))
 
 			return nil
 		},
@@ -483,6 +580,9 @@ func skillsCmd() *cobra.Command {
 		},
 	}
 
+	var payloadFlag string
+	var withLLM bool
+
 	runCmd := &cobra.Command{
 		Use:   "run <name>",
 		Short: "Manually trigger a skill",
@@ -493,23 +593,94 @@ func skillsCmd() *cobra.Command {
 			loaded, _ := skills.LoadAll(cfg.SkillsDir(), bundledDir)
 
 			name := args[0]
-			for _, s := range loaded {
-				if s.Manifest.Name == name {
-					fmt.Printf("Running skill: %s\n", name)
-					result, err := skills.Run(context.Background(), s, map[string]any{"manual": true}, nil)
-					if err != nil {
-						return err
-					}
-					fmt.Println(result.Stdout)
-					if result.Stderr != "" {
-						fmt.Fprintf(os.Stderr, "%s", result.Stderr)
-					}
-					return nil
+			var target *skills.Skill
+			for i := range loaded {
+				if loaded[i].Manifest.Name == name {
+					target = &loaded[i]
+					break
 				}
 			}
-			return fmt.Errorf("skill not found: %s", name)
+			if target == nil {
+				return fmt.Errorf("skill not found: %s", name)
+			}
+
+			payload := map[string]any{"manual": true, "trigger": "manual"}
+			if payloadFlag != "" {
+				var extra map[string]any
+				if err := json.Unmarshal([]byte(payloadFlag), &extra); err != nil {
+					return fmt.Errorf("--payload must be valid JSON: %w", err)
+				}
+				for k, v := range extra {
+					payload[k] = v
+				}
+			}
+
+			envVars := map[string]string{
+				"AGENTD_CONFIG_DIR": cfg.StateDir(),
+				"AGENTD_STATE_DIR":  cfg.StateDir(),
+			}
+			result, err := skills.Run(cmd.Context(), *target, payload, envVars)
+			if err != nil {
+				return err
+			}
+
+			exitStatus := "0"
+			if result.ExitCode != 0 {
+				exitStatus = fmt.Sprintf("%d (failed)", result.ExitCode)
+			}
+			fmt.Println(tui.RenderKeyValueCard("Result", []tui.KeyValue{
+				{Label: "Skill",     Value: target.Manifest.Name},
+				{Label: "Exit code", Value: exitStatus},
+				{Label: "Duration",  Value: result.Duration.Round(time.Millisecond).String()},
+			}))
+
+			if result.Stdout != "" {
+				fmt.Println(tui.RenderCodeCard("Output", strings.TrimRight(result.Stdout, "\n")))
+			}
+			if result.Stderr != "" {
+				fmt.Println(tui.RenderCodeCard("Stderr", strings.TrimRight(result.Stderr, "\n")))
+			}
+
+			if withLLM {
+				if cfg.LLM.APIKey == "" {
+					fmt.Println(tui.Muted("--llm: no API key configured, skipping"))
+					return nil
+				}
+				llmClient, err := llm.NewClient(cfg.LLM)
+				if err != nil {
+					return fmt.Errorf("initializing LLM: %w", err)
+				}
+				store, err := db.Open(cfg.DBPath())
+				if err != nil {
+					return fmt.Errorf("opening database: %w", err)
+				}
+				defer store.Close()
+
+				event := watchers.Event{
+					Source:    "manual",
+					Type:      "run",
+					Payload:   payload,
+					Timestamp: time.Now(),
+				}
+				systemPrompt := agent.BuildSystemPrompt(cfg.Agent.Name, loaded, store)
+				userMessage := agent.BuildEventMessage(event, result.Stdout)
+				resp, err := llmClient.Complete(cmd.Context(), llm.CompletionRequest{
+					SystemPrompt: systemPrompt,
+					Messages:     []llm.Message{{Role: "user", Content: userMessage}},
+					MaxTokens:    2048,
+					Temperature:  0.3,
+				})
+				if err != nil {
+					return fmt.Errorf("LLM call failed: %w", err)
+				}
+				fmt.Println(tui.RenderCodeCard("LLM response", resp.Content))
+			}
+
+			return nil
 		},
 	}
+	runCmd.Flags().StringVar(&payloadFlag, "payload", "", `JSON payload merged into the event (e.g. '{"file":"main.go"}')`)
+	runCmd.Flags().BoolVar(&withLLM, "llm", false, "Pass skill output through the LLM and show the response")
 
 	cmd.AddCommand(listCmd, runCmd)
 
@@ -666,12 +837,6 @@ func mcpCmd() *cobra.Command {
 		Short: "Show MCP server connection info",
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg := loadConfig()
-			fmt.Println("MCP Server Configuration")
-			fmt.Println("========================")
-			fmt.Printf("Endpoint: http://localhost:%d/mcp\n", cfg.MCP.Port)
-			fmt.Println()
-			fmt.Println("Add to .vscode/mcp.json or Claude Code config:")
-			fmt.Println()
 			mcpConfig := map[string]any{
 				"mcpServers": map[string]any{
 					"agentd": map[string]any{
@@ -680,7 +845,13 @@ func mcpCmd() *cobra.Command {
 				},
 			}
 			data, _ := json.MarshalIndent(mcpConfig, "", "  ")
-			fmt.Println(string(data))
+			fmt.Println(tui.RenderStack(
+				tui.RenderKeyValueCard("MCP server", []tui.KeyValue{
+					{Label: "Enabled", Value: fmt.Sprintf("%t", cfg.MCP.Enabled)},
+					{Label: "Endpoint", Value: fmt.Sprintf("http://localhost:%d/mcp", cfg.MCP.Port)},
+				}),
+				tui.RenderCodeCard("Editor config", string(data)),
+			))
 		},
 	}
 }
@@ -794,37 +965,28 @@ func runInteractiveInit() error {
 		return err
 	}
 
-	fmt.Println()
-	fmt.Println("  Setup complete")
-	fmt.Println("  --------------")
-	fmt.Println("  Config:", cfgPath)
-	fmt.Printf("  Provider: %s\n", describeProvider(cfg))
-	if cfg.MCP.Enabled {
-		fmt.Printf("  MCP: http://localhost:%d/mcp\n", cfg.MCP.Port)
+	setupCards := []string{
+		tui.RenderKeyValueCard("Setup complete", []tui.KeyValue{
+			{Label: "Config", Value: cfgPath},
+			{Label: "Provider", Value: describeProvider(cfg)},
+			{Label: "MCP", Value: enabledValue(cfg.MCP.Enabled, fmt.Sprintf("http://localhost:%d/mcp", cfg.MCP.Port))},
+			{Label: "Webhook", Value: enabledValue(cfg.Watchers.Webhook.Enabled, fmt.Sprintf("http://localhost:%d/webhook", cfg.Watchers.Webhook.Port))},
+		}),
+		tui.RenderListCard("Next steps", []string{
+			"agentd start      Start watching in the foreground",
+			"agentd start -d   Start as a background process",
+			"agentd skills     See what is installed",
+			"agentd status     Check recent events and actions",
+		}),
 	}
-	if cfg.Watchers.Webhook.Enabled {
-		fmt.Printf("  Webhook: http://localhost:%d/webhook\n", cfg.Watchers.Webhook.Port)
-	}
-
 	if needsAPIKeyHint(cfg) {
-		fmt.Println()
-		fmt.Println("  No API key configured yet.")
-		if cfg.LLM.Provider == "anthropic" {
-			fmt.Println("  Export one later with:")
-			fmt.Println("    export ANTHROPIC_API_KEY=your-key")
-		} else if cfg.LLM.Provider == "openai" {
-			fmt.Println("  Export one later with:")
-			fmt.Println("    export OPENAI_API_KEY=your-key")
-		}
+		setupCards = append(setupCards, tui.RenderListCard("Credential hint", []string{
+			"No API key configured yet.",
+			apiKeyHint(cfg),
+		}))
 	}
-
 	fmt.Println()
-	fmt.Println("  Next steps:")
-	fmt.Println("    agentd start          Start watching in the foreground")
-	fmt.Println("    agentd start -d       Start as a background process")
-	fmt.Println("    agentd skills         See what is installed")
-	fmt.Println("    agentd status         Check recent events and actions")
-	fmt.Println()
+	fmt.Println(tui.RenderStack(setupCards...))
 
 	return nil
 }
@@ -872,8 +1034,12 @@ func describeProvider(cfg config.Config) string {
 			return fmt.Sprintf("%s (%s, via env)", cfg.LLM.Provider, cfg.LLM.Model)
 		}
 		return fmt.Sprintf("%s (%s, stored in config)", cfg.LLM.Provider, cfg.LLM.Model)
-	case "ollama":
-		return fmt.Sprintf("ollama (%s via %s)", cfg.LLM.Model, cfg.LLM.BaseURL)
+	case "openai-compatible":
+		base := cfg.LLM.BaseURL
+		if base == "" {
+			base = "http://localhost:11434/v1"
+		}
+		return fmt.Sprintf("openai-compatible (%s @ %s)", cfg.LLM.Model, base)
 	default:
 		return "not configured"
 	}
@@ -881,6 +1047,24 @@ func describeProvider(cfg config.Config) string {
 
 func needsAPIKeyHint(cfg config.Config) bool {
 	return (cfg.LLM.Provider == "anthropic" || cfg.LLM.Provider == "openai") && cfg.LLM.APIKey == ""
+}
+
+func apiKeyHint(cfg config.Config) string {
+	switch cfg.LLM.Provider {
+	case "anthropic":
+		return "export ANTHROPIC_API_KEY=your-key"
+	case "openai":
+		return "export OPENAI_API_KEY=your-key"
+	default:
+		return ""
+	}
+}
+
+func enabledValue(enabled bool, value string) string {
+	if enabled {
+		return value
+	}
+	return "disabled"
 }
 
 func fetchLatestRelease(ctx context.Context) (githubRelease, error) {
@@ -991,20 +1175,13 @@ func stopAgentProcess(cfg config.Config) error {
 
 func printBanner(cfg config.Config) {
 	fmt.Println()
-	fmt.Println("  ╔══════════════════════════════════════╗")
-	fmt.Println("  ║            agentd running            ║")
-	fmt.Println("  ╚══════════════════════════════════════╝")
-	fmt.Println()
-	fmt.Printf("  Provider:  %s (%s)\n", cfg.LLM.Provider, cfg.LLM.Model)
-	if cfg.Watchers.Webhook.Enabled {
-		fmt.Printf("  Webhook:   http://localhost:%d/webhook\n", cfg.Watchers.Webhook.Port)
-	}
-	if cfg.MCP.Enabled {
-		fmt.Printf("  MCP:       http://localhost:%d/mcp\n", cfg.MCP.Port)
-	}
-	fmt.Printf("  State:     %s\n", cfg.StateDir())
-	fmt.Println()
-	fmt.Println("  Press Ctrl+C to stop")
+	fmt.Println(tui.RenderKeyValueCard("agentd running", []tui.KeyValue{
+		{Label: "Provider", Value: fmt.Sprintf("%s (%s)", cfg.LLM.Provider, cfg.LLM.Model)},
+		{Label: "Webhook", Value: enabledValue(cfg.Watchers.Webhook.Enabled, fmt.Sprintf("http://localhost:%d/webhook", cfg.Watchers.Webhook.Port))},
+		{Label: "MCP", Value: enabledValue(cfg.MCP.Enabled, fmt.Sprintf("http://localhost:%d/mcp", cfg.MCP.Port))},
+		{Label: "State", Value: cfg.StateDir()},
+	}))
+	fmt.Println(tui.Muted("Press Ctrl+C to stop"))
 	fmt.Println()
 }
 

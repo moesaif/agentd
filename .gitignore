@@ -8,3 +8,11 @@ dist/
 .claude/
 .gocache/
 .gomodcache/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.zip
+*.tar.gz

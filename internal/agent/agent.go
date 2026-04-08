@@ -1,9 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -149,17 +152,71 @@ func (a *Agent) executeSkill(ctx context.Context, skill skills.Skill, event watc
 	}
 }
 
+// agentTools defines the actions the LLM can take via native tool-use.
+var agentTools = []llm.ToolDefinition{
+	{
+		Name:        "shell",
+		Description: "Run a shell command on the host machine",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{
+					"type":        "string",
+					"description": "The shell command to execute",
+				},
+			},
+			"required": []string{"command"},
+		},
+	},
+	{
+		Name:        "http",
+		Description: "Make an outbound HTTP request (Slack webhook, GitHub API, etc.)",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"url":     map[string]any{"type": "string", "description": "Request URL"},
+				"method":  map[string]any{"type": "string", "enum": []string{"GET", "POST", "PUT", "PATCH", "DELETE"}, "description": "HTTP method (default GET)"},
+				"headers": map[string]any{"type": "object", "description": "HTTP headers as key/value strings"},
+				"body":    map[string]any{"description": "Request body — string or JSON object"},
+			},
+			"required": []string{"url"},
+		},
+	},
+	{
+		Name:        "notify",
+		Description: "Send a desktop notification to the user",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"message": map[string]any{"type": "string", "description": "Notification body text"},
+				"title":   map[string]any{"type": "string", "description": "Notification title (default: agentd)"},
+			},
+			"required": []string{"message"},
+		},
+	},
+	{
+		Name:        "log",
+		Description: "Log a message when no further action is needed",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"message": map[string]any{"type": "string", "description": "Message to log"},
+			},
+			"required": []string{"message"},
+		},
+	},
+}
+
 func (a *Agent) processWithLLM(ctx context.Context, skill skills.Skill, event watchers.Event, result skills.RunResult, eventID int64) {
 	systemPrompt := BuildSystemPrompt(a.config.Agent.Name, a.skills, a.db)
 	userMessage := BuildEventMessage(event, result.Stdout)
 
 	resp, err := a.llm.Complete(ctx, llm.CompletionRequest{
 		SystemPrompt: systemPrompt,
-		Messages: []llm.Message{
-			{Role: "user", Content: userMessage},
-		},
-		MaxTokens:   2048,
-		Temperature: 0.3,
+		Messages:     []llm.Message{{Role: "user", Content: userMessage}},
+		MaxTokens:    2048,
+		Temperature:  0.3,
+		Tools:        agentTools,
 	})
 	if err != nil {
 		log.Error("LLM processing failed", "error", err)
@@ -167,15 +224,21 @@ func (a *Agent) processWithLLM(ctx context.Context, skill skills.Skill, event wa
 		return
 	}
 
-	log.Debug("LLM response", "content", resp.Content, "tokens", resp.TokensUsed)
+	log.Debug("LLM response", "tool_calls", len(resp.ToolCalls), "tokens", resp.TokensUsed)
 
-	// Parse actions from LLM response
+	// Prefer native tool calls; fall back to ACTION: line parsing (e.g. Ollama)
+	if len(resp.ToolCalls) > 0 {
+		for _, tc := range resp.ToolCalls {
+			a.executeAction(ctx, ParsedAction{Type: tc.Name, Payload: tc.Input}, skill.Manifest.Name, eventID, resp.Content)
+		}
+		return
+	}
+
 	actions := parseActions(resp.Content)
 	if len(actions) == 0 {
 		a.db.InsertAction(eventID, skill.Manifest.Name, resp.Content, "log", map[string]any{"response": resp.Content}, "completed")
 		return
 	}
-
 	for _, action := range actions {
 		a.executeAction(ctx, action, skill.Manifest.Name, eventID, resp.Content)
 	}
@@ -257,9 +320,73 @@ func (a *Agent) executeShellAction(ctx context.Context, payload map[string]any) 
 }
 
 func (a *Agent) executeHTTPAction(ctx context.Context, payload map[string]any) error {
-	// HTTP actions would make outbound requests
-	// For safety, just log them for now
-	log.Info("HTTP action requested", "payload", payload)
+	url, ok := payload["url"].(string)
+	if !ok || url == "" {
+		return fmt.Errorf("http action missing 'url' field")
+	}
+
+	method := "GET"
+	if m, ok := payload["method"].(string); ok && m != "" {
+		method = strings.ToUpper(m)
+	}
+
+	// Build body
+	var bodyReader io.Reader
+	switch v := payload["body"].(type) {
+	case string:
+		if v != "" {
+			bodyReader = strings.NewReader(v)
+		}
+	case map[string]any:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("marshaling http body: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+
+	// Timeout override
+	if secs, ok := payload["timeout"].(float64); ok && secs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(secs)*time.Second)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	if err != nil {
+		return fmt.Errorf("building http request: %w", err)
+	}
+
+	// Default Content-Type when body is an object
+	if _, isObj := payload["body"].(map[string]any); isObj {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Custom headers
+	if headers, ok := payload["headers"].(map[string]any); ok {
+		for k, v := range headers {
+			if s, ok := v.(string); ok {
+				req.Header.Set(k, s)
+			}
+		}
+	}
+
+	log.Info("http action", "method", method, "url", url)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	log.Debug("http response", "status", resp.StatusCode, "body", strings.TrimSpace(string(respBody)))
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("http %s %s returned %d: %s", method, url, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
 	return nil
 }
 

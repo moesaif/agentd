@@ -15,11 +15,18 @@ type AnthropicClient struct {
 	model  string
 }
 
+type anthropicTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"input_schema"`
+}
+
 type anthropicRequest struct {
 	Model     string             `json:"model"`
 	MaxTokens int                `json:"max_tokens"`
 	System    string             `json:"system,omitempty"`
 	Messages  []anthropicMessage `json:"messages"`
+	Tools     []anthropicTool    `json:"tools,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -27,11 +34,16 @@ type anthropicMessage struct {
 	Content string `json:"content"`
 }
 
+type anthropicContentBlock struct {
+	Type  string         `json:"type"`
+	Text  string         `json:"text,omitempty"`
+	Name  string         `json:"name,omitempty"`
+	Input map[string]any `json:"input,omitempty"`
+}
+
 type anthropicResponse struct {
-	Content []struct {
-		Text string `json:"text"`
-	} `json:"content"`
-	Usage struct {
+	Content []anthropicContentBlock `json:"content"`
+	Usage   struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
@@ -60,6 +72,18 @@ func (c *AnthropicClient) Complete(ctx context.Context, req CompletionRequest) (
 		MaxTokens: maxTokens,
 		System:    req.SystemPrompt,
 		Messages:  messages,
+	}
+
+	if len(req.Tools) > 0 {
+		tools := make([]anthropicTool, len(req.Tools))
+		for i, t := range req.Tools {
+			tools[i] = anthropicTool{
+				Name:        t.Name,
+				Description: t.Description,
+				InputSchema: t.Parameters,
+			}
+		}
+		body.Tools = tools
 	}
 
 	data, err := json.Marshal(body)
@@ -101,8 +125,23 @@ func (c *AnthropicClient) Complete(ctx context.Context, req CompletionRequest) (
 		return CompletionResponse{}, fmt.Errorf("no content in response")
 	}
 
+	var text string
+	var toolCalls []ToolCall
+	for _, block := range result.Content {
+		switch block.Type {
+		case "text":
+			text = block.Text
+		case "tool_use":
+			toolCalls = append(toolCalls, ToolCall{
+				Name:  block.Name,
+				Input: block.Input,
+			})
+		}
+	}
+
 	return CompletionResponse{
-		Content:    result.Content[0].Text,
+		Content:    text,
+		ToolCalls:  toolCalls,
 		TokensUsed: result.Usage.InputTokens + result.Usage.OutputTokens,
 	}, nil
 }

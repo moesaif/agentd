@@ -161,8 +161,8 @@ func (m initModel) submitMenu() (tea.Model, tea.Cmd) {
 			m.setProvider("openai")
 			return m.setStep(stepKeySource)
 		case 2:
-			m.setProvider("ollama")
-			return m.setStep(stepModel)
+			m.setProvider("openai-compatible")
+			return m.setStep(stepKeySource)
 		default:
 			m.keyInputRequired = false
 			m.cfg.LLM.Provider = ""
@@ -237,7 +237,7 @@ func (m initModel) submitInput() (tea.Model, tea.Cmd) {
 		if value != "" {
 			m.cfg.LLM.Model = value
 		}
-		if m.cfg.LLM.Provider == "openai" || m.cfg.LLM.Provider == "ollama" {
+		if m.cfg.LLM.Provider == "openai" || m.cfg.LLM.Provider == "openai-compatible" {
 			return m.setStep(stepBaseURL)
 		}
 		return m.setStep(stepAgentName)
@@ -267,15 +267,15 @@ func (m initModel) goBack() (tea.Model, tea.Cmd) {
 		return m.setStep(stepKeySource)
 	case stepModel:
 		switch m.cfg.LLM.Provider {
-		case "anthropic", "openai":
+		case "anthropic", "openai", "openai-compatible":
 			return m.setStep(stepKeySource)
-		case "ollama", "":
+		default:
 			return m.setStep(stepProvider)
 		}
 	case stepBaseURL:
 		return m.setStep(stepModel)
 	case stepAgentName:
-		if m.cfg.LLM.Provider == "openai" || m.cfg.LLM.Provider == "ollama" {
+		if m.cfg.LLM.Provider == "openai" || m.cfg.LLM.Provider == "openai-compatible" {
 			return m.setStep(stepBaseURL)
 		}
 		return m.setStep(stepProvider)
@@ -316,7 +316,7 @@ func (m initModel) setStep(step initStep) (tea.Model, tea.Cmd) {
 		if m.cfg.LLM.Provider == "openai" {
 			input.Placeholder = "https://api.openai.com/v1"
 		} else {
-			input.Placeholder = "http://localhost:11434/v1"
+			input.Placeholder = "http://localhost:11434/v1  (Ollama default)"
 		}
 	case stepAgentName:
 		input.Placeholder = "agentd"
@@ -351,14 +351,16 @@ func (m initModel) setProvider(provider string) {
 		if m.cfg.LLM.Model == "" || strings.HasPrefix(m.cfg.LLM.Model, "claude-") || m.cfg.LLM.Model == "llama3" {
 			m.cfg.LLM.Model = "gpt-4o"
 		}
-	case "ollama":
-		m.keyInputRequired = false
-		m.cfg.LLM.APIKey = "ollama"
-		if m.cfg.LLM.BaseURL == "" || strings.Contains(m.cfg.LLM.BaseURL, "api.openai.com") {
+	case "openai-compatible":
+		if prev != provider {
+			m.cfg.LLM.APIKey = ""
+			m.keyInputRequired = false
+		}
+		if m.cfg.LLM.BaseURL == "" || strings.Contains(m.cfg.LLM.BaseURL, "api.openai.com") || strings.Contains(m.cfg.LLM.BaseURL, "api.anthropic.com") {
 			m.cfg.LLM.BaseURL = "http://localhost:11434/v1"
 		}
 		if m.cfg.LLM.Model == "" || strings.HasPrefix(m.cfg.LLM.Model, "claude-") || strings.HasPrefix(m.cfg.LLM.Model, "gpt-") {
-			m.cfg.LLM.Model = "llama3"
+			m.cfg.LLM.Model = "llama3.2"
 		}
 	}
 }
@@ -403,9 +405,9 @@ func (m initModel) viewContent() string {
 		b.WriteString(m.input.View())
 	case stepBaseURL:
 		if m.cfg.LLM.Provider == "openai" {
-			b.WriteString("Optional base URL for OpenAI-compatible providers. Leave blank for the official API.\n\n")
+			b.WriteString("Optional base URL. Leave blank to use the official OpenAI API.\n\n")
 		} else {
-			b.WriteString("Confirm the Ollama base URL.\n\n")
+			b.WriteString("Base URL for the OpenAI-compatible endpoint (e.g. Ollama, Groq, Together AI).\n\n")
 		}
 		b.WriteString(m.input.View())
 	case stepAgentName:
@@ -445,17 +447,15 @@ func (m initModel) stepOrder() []initStep {
 	order := []initStep{stepIntro, stepProvider}
 
 	switch m.cfg.LLM.Provider {
-	case "anthropic", "openai":
+	case "anthropic", "openai", "openai-compatible":
 		order = append(order, stepKeySource)
 		if m.keyInputRequired || m.step == stepKeyInput {
 			order = append(order, stepKeyInput)
 		}
 		order = append(order, stepModel)
-		if m.cfg.LLM.Provider == "openai" {
+		if m.cfg.LLM.Provider == "openai" || m.cfg.LLM.Provider == "openai-compatible" {
 			order = append(order, stepBaseURL)
 		}
-	case "ollama":
-		order = append(order, stepModel, stepBaseURL)
 	default:
 	}
 
@@ -468,8 +468,8 @@ func (m initModel) currentOptions() []menuOption {
 	case stepProvider:
 		return []menuOption{
 			{Title: "Anthropic API", Desc: "Use Claude models with an Anthropic API key"},
-			{Title: "OpenAI API", Desc: "Use OpenAI or another OpenAI-compatible provider"},
-			{Title: "Ollama", Desc: "Run against a local model through Ollama"},
+			{Title: "OpenAI API", Desc: "Use OpenAI models with an OpenAI API key"},
+			{Title: "OpenAI-compatible", Desc: "Ollama, Groq, Together AI, LM Studio, or any compatible endpoint"},
 			{Title: "Skip for now", Desc: "Set up the rest of agentd without an LLM"},
 		}
 	case stepKeySource:
@@ -578,6 +578,8 @@ func keySourcePrompt(provider string) string {
 		return "Choose how agentd should get the Anthropic API key."
 	case "openai":
 		return "Choose how agentd should get the OpenAI API key."
+	case "openai-compatible":
+		return "Does this endpoint require an API key? (Groq/Together: yes — Ollama: skip)"
 	default:
 		return "Choose how agentd should get the API key."
 	}
@@ -593,8 +595,16 @@ func providerSummary(cfg config.Config) string {
 			return fmt.Sprintf("%s (%s, via env)", cfg.LLM.Provider, cfg.LLM.Model)
 		}
 		return fmt.Sprintf("%s (%s, stored in config)", cfg.LLM.Provider, cfg.LLM.Model)
-	case "ollama":
-		return fmt.Sprintf("ollama (%s via %s)", cfg.LLM.Model, cfg.LLM.BaseURL)
+	case "openai-compatible":
+		keyDesc := "no key"
+		if cfg.LLM.APIKey != "" {
+			if strings.HasPrefix(cfg.LLM.APIKey, "${") {
+				keyDesc = "via env"
+			} else {
+				keyDesc = "key set"
+			}
+		}
+		return fmt.Sprintf("openai-compatible (%s @ %s, %s)", cfg.LLM.Model, cfg.LLM.BaseURL, keyDesc)
 	default:
 		return "not configured"
 	}

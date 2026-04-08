@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>agentd</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #09090b;
+  --surface:   #18181b;
+  --surface2:  #27272a;
+  --border:    #3f3f46;
+  --text:      #fafafa;
+  --muted:     #a1a1aa;
+  --dim:       #52525b;
+  --accent:    #a855f7;
+  --accent-bg: rgba(168,85,247,.12);
+  --green:     #22c55e;
+  --red:       #f87171;
+  --yellow:    #fbbf24;
+  --blue:      #60a5fa;
+  --radius:    8px;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+}
+
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; line-height: 1.5; overflow: hidden; }
+
+/* ── layout ── */
+.app { display: grid; grid-template-rows: 48px 1fr; height: 100vh; }
+
+.topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 16px;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.topbar-brand { font-weight: 700; font-size: 15px; color: var(--accent); letter-spacing: -.3px; }
+.topbar-sep { color: var(--dim); }
+.topbar-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 100px;
+  background: var(--surface2); border: 1px solid var(--border);
+  font-size: 12px; color: var(--muted);
+}
+.topbar-chip .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+.topbar-chip .dot.off { background: var(--dim); }
+.topbar-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+.body { display: grid; grid-template-columns: 220px 1fr 260px; overflow: hidden; height: 100%; }
+
+/* ── panels ── */
+.panel { display: flex; flex-direction: column; border-right: 1px solid var(--border); overflow: hidden; }
+.panel:last-child { border-right: none; border-left: 1px solid var(--border); }
+
+.panel-header {
+  padding: 10px 12px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .8px;
+  color: var(--muted); border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.panel-scroll { overflow-y: auto; flex: 1; }
+.panel-scroll::-webkit-scrollbar { width: 4px; }
+.panel-scroll::-webkit-scrollbar-track { background: transparent; }
+.panel-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ── skills sidebar ── */
+.skill-item {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px; border-bottom: 1px solid var(--border);
+  transition: background .1s;
+}
+.skill-item:hover { background: var(--surface2); }
+.skill-name { font-weight: 600; font-size: 13px; }
+.skill-desc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.skill-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+.skill-trigger { font-size: 11px; color: var(--dim); font-family: var(--font-mono); }
+.run-btn {
+  padding: 2px 10px; border-radius: 4px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--muted); font-size: 11px; font-weight: 600;
+  cursor: pointer; transition: all .15s; white-space: nowrap;
+}
+.run-btn:hover { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+.run-btn:active { transform: scale(.97); }
+.run-btn:disabled { opacity: .5; cursor: not-allowed; }
+.no-skills { padding: 16px 12px; color: var(--muted); font-size: 12px; }
+
+/* ── chat main ── */
+.chat-main { display: flex; flex-direction: column; overflow: hidden; }
+
+.messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+.msg { display: flex; flex-direction: column; gap: 4px; max-width: 85%; }
+.msg.user { align-self: flex-end; align-items: flex-end; }
+.msg.agent, .msg.skill, .msg.system, .msg.error { align-self: flex-start; align-items: flex-start; }
+
+.msg-header { display: flex; align-items: center; gap: 6px; }
+.msg-role { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; }
+.msg.user    .msg-role { color: var(--accent); }
+.msg.agent   .msg-role { color: var(--green); }
+.msg.skill   .msg-role { color: var(--yellow); }
+.msg.system  .msg-role { color: var(--dim); }
+.msg.error   .msg-role { color: var(--red); }
+.msg-ts { font-size: 11px; color: var(--dim); }
+
+.msg-bubble {
+  padding: 10px 14px; border-radius: var(--radius); line-height: 1.6; word-break: break-word;
+  white-space: pre-wrap;
+}
+.msg.user  .msg-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 2px; }
+.msg.agent .msg-bubble { background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 2px; }
+.msg.error .msg-bubble { background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.3); color: var(--red); }
+.msg.system .msg-bubble { background: transparent; border: none; color: var(--dim); font-size: 12px; padding: 0; }
+.msg.skill .msg-bubble {
+  background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 2px;
+  font-family: var(--font-mono); font-size: 12px; max-width: 100%;
+  border-left: 3px solid var(--yellow);
+}
+
+/* code blocks inside agent messages */
+.msg-bubble code {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px;
+  font-family: var(--font-mono); font-size: 12px;
+}
+.msg-bubble pre {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px; overflow-x: auto; margin-top: 6px;
+}
+.msg-bubble pre code { background: none; border: none; padding: 0; }
+
+/* thinking animation */
+.thinking-dots span {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--muted); margin: 0 2px;
+  animation: bounce .9s infinite ease-in-out;
+}
+.thinking-dots span:nth-child(2) { animation-delay: .15s; }
+.thinking-dots span:nth-child(3) { animation-delay: .3s; }
+@keyframes bounce { 0%,80%,100% { transform: translateY(0); opacity:.4; } 40% { transform: translateY(-5px); opacity:1; } }
+
+/* ── input area ── */
+.input-area {
+  padding: 12px 16px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; align-items: flex-end;
+  background: var(--surface); flex-shrink: 0;
+}
+.input-wrap { flex: 1; position: relative; }
+#chat-input {
+  width: 100%; min-height: 42px; max-height: 120px;
+  padding: 10px 14px; padding-right: 40px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 14px;
+  resize: none; outline: none; font-family: inherit; line-height: 1.5;
+  transition: border-color .15s;
+}
+#chat-input::placeholder { color: var(--dim); }
+#chat-input:focus { border-color: var(--accent); }
+#send-btn {
+  padding: 10px 18px; background: var(--accent); color: #fff;
+  border: none; border-radius: var(--radius); font-weight: 600; font-size: 14px;
+  cursor: pointer; transition: all .15s; white-space: nowrap; flex-shrink: 0;
+}
+#send-btn:hover { background: #9333ea; }
+#send-btn:active { transform: scale(.97); }
+#send-btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+.input-hint { font-size: 11px; color: var(--dim); padding: 4px 0 0 2px; }
+
+/* ── activity panel ── */
+.activity-section { display: flex; flex-direction: column; }
+.activity-label { padding: 8px 12px 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; color: var(--dim); }
+.activity-item { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: flex-start; }
+.activity-icon { flex-shrink: 0; width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; }
+.activity-icon.event  { background: var(--blue); }
+.activity-icon.action { background: var(--green); }
+.activity-icon.failed { background: var(--red); }
+.activity-body { flex: 1; min-width: 0; }
+.activity-title { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.activity-sub { font-size: 11px; color: var(--muted); }
+.activity-ts { font-size: 10px; color: var(--dim); white-space: nowrap; }
+
+.empty-state { padding: 16px 12px; color: var(--dim); font-size: 12px; font-style: italic; }
+
+/* ── welcome message ── */
+.welcome { padding: 32px 16px; text-align: center; color: var(--muted); }
+.welcome h2 { font-size: 18px; color: var(--text); margin-bottom: 8px; }
+.welcome p { font-size: 13px; line-height: 1.7; }
+.welcome code { background: var(--surface2); border: 1px solid var(--border); padding: 1px 5px; border-radius: 3px; font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
+
+/* ── status badge ── */
+.badge { display: inline-block; padding: 1px 7px; border-radius: 100px; font-size: 11px; font-weight: 600; }
+.badge.ok      { background: rgba(34,197,94,.15); color: var(--green); }
+.badge.pending { background: rgba(251,191,36,.15); color: var(--yellow); }
+.badge.failed  { background: rgba(248,113,113,.15); color: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <span class="topbar-brand">agentd</span>
+    <span class="topbar-sep">·</span>
+    <span class="topbar-chip" id="chip-provider">
+      <span class="dot off" id="chip-dot"></span>
+      <span id="chip-label">connecting…</span>
+    </span>
+    <span class="topbar-chip" id="chip-skills" style="display:none">
+      <span id="chip-skills-label"></span>
+    </span>
+    <div class="topbar-right">
+      <span id="chip-status" class="badge"></span>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <!-- Skills sidebar -->
+    <div class="panel" id="panel-skills">
+      <div class="panel-header">Skills</div>
+      <div class="panel-scroll" id="skills-list">
+        <div class="no-skills">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Chat -->
+    <div class="chat-main">
+      <div class="messages" id="messages">
+        <div class="welcome">
+          <h2>Welcome to agentd</h2>
+          <p>Ask anything or use <code>/run &lt;skill&gt;</code> to trigger a skill.<br>Click <strong>Run</strong> on any skill in the sidebar to test it directly.</p>
+        </div>
+      </div>
+      <div class="input-area">
+        <div class="input-wrap">
+          <textarea id="chat-input" rows="1" placeholder="Message agentd… (Enter to send, Shift+Enter for newline)"></textarea>
+        </div>
+        <button id="send-btn">Send</button>
+      </div>
+      <div style="padding:4px 16px 8px;" class="input-hint" id="input-hint">↑ scroll messages</div>
+    </div>
+
+    <!-- Activity panel -->
+    <div class="panel" id="panel-activity">
+      <div class="panel-header">Activity</div>
+      <div class="panel-scroll" id="activity-list">
+        <div class="empty-state">No activity yet.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── state ─────────────────────────────────────────────────────────────────────
+const state = {
+  messages: [],       // {role, content, ts}
+  history: [],        // LLM conversation history [{role, content}]
+  thinking: false,
+  llmReady: false,
+};
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+function fmt_time(iso) {
+  const d = new Date(iso || Date.now());
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function escape_html(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function render_markdown(text) {
+  // code blocks
+  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    return `<pre><code>${escape_html(code.trim())}</code></pre>`;
+  });
+  // inline code
+  text = text.replace(/`([^`]+)`/g, (_, c) => `<code>${escape_html(c)}</code>`);
+  // bold
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // preserve line breaks
+  return text.replace(/\n/g, '<br>');
+}
+
+// ── UI: status bar ────────────────────────────────────────────────────────────
+async function load_status() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    state.llmReady = s.llm_ready;
+
+    const dot = document.getElementById('chip-dot');
+    const label = document.getElementById('chip-label');
+    const badge = document.getElementById('chip-status');
+
+    if (s.llm_ready) {
+      dot.classList.remove('off');
+      label.textContent = `${s.provider} / ${s.model}`;
+      badge.textContent = 'ready';
+      badge.className = 'badge ok';
+    } else {
+      dot.classList.add('off');
+      label.textContent = s.provider ? `${s.provider} (no key)` : 'no LLM';
+      badge.textContent = 'no LLM';
+      badge.className = 'badge pending';
+    }
+
+    const chipSkills = document.getElementById('chip-skills');
+    const chipSkillsLabel = document.getElementById('chip-skills-label');
+    chipSkillsLabel.textContent = `${s.skills_count} skill${s.skills_count !== 1 ? 's' : ''}`;
+    chipSkills.style.display = 'inline-flex';
+  } catch(e) {
+    document.getElementById('chip-label').textContent = 'offline';
+    document.getElementById('chip-status').textContent = 'offline';
+    document.getElementById('chip-status').className = 'badge failed';
+  }
+}
+
+// ── UI: skills panel ──────────────────────────────────────────────────────────
+async function load_skills() {
+  const list = document.getElementById('skills-list');
+  try {
+    const r = await fetch('/api/skills');
+    const skills = await r.json();
+    if (!skills || skills.length === 0) {
+      list.innerHTML = '<div class="no-skills">No skills loaded.</div>';
+      return;
+    }
+    list.innerHTML = skills.map(s => `
+      <div class="skill-item">
+        <div class="skill-name">${escape_html(s.name)}</div>
+        <div class="skill-desc">${escape_html(s.description || '')}</div>
+        <div class="skill-footer">
+          <span class="skill-trigger">${(s.triggers||[]).join(', ') || 'manual'}</span>
+          <button class="run-btn" data-skill="${escape_html(s.name)}" onclick="run_skill('${escape_html(s.name)}', this)">▶ Run</button>
+        </div>
+      </div>
+    `).join('');
+  } catch(e) {
+    list.innerHTML = '<div class="no-skills">Failed to load.</div>';
+  }
+}
+
+// ── UI: activity panel ────────────────────────────────────────────────────────
+async function load_activity() {
+  try {
+    const r = await fetch('/api/history');
+    const data = await r.json();
+    const list = document.getElementById('activity-list');
+
+    const events  = (data.events  || []).slice(0, 10);
+    const actions = (data.actions || []).slice(0, 10);
+
+    if (events.length === 0 && actions.length === 0) {
+      list.innerHTML = '<div class="empty-state">No activity yet.</div>';
+      return;
+    }
+
+    let html = '';
+
+    if (events.length > 0) {
+      html += '<div class="activity-label">Events</div>';
+      html += events.map(e => `
+        <div class="activity-item">
+          <div class="activity-icon event"></div>
+          <div class="activity-body">
+            <div class="activity-title">${escape_html(e.source)}.${escape_html(e.type)}</div>
+          </div>
+          <div class="activity-ts">${fmt_time(e.created_at)}</div>
+        </div>
+      `).join('');
+    }
+
+    if (actions.length > 0) {
+      html += '<div class="activity-label">Actions</div>';
+      html += actions.map(a => {
+        const iconClass = a.status === 'failed' ? 'failed' : 'action';
+        return `
+          <div class="activity-item">
+            <div class="activity-icon ${iconClass}"></div>
+            <div class="activity-body">
+              <div class="activity-title">${escape_html(a.skill_name)}</div>
+              <div class="activity-sub">${escape_html(a.action_type)} · <span class="badge ${a.status === 'completed' ? 'ok' : a.status === 'failed' ? 'failed' : 'pending'}">${escape_html(a.status)}</span></div>
+            </div>
+            <div class="activity-ts">${fmt_time(a.created_at)}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    list.innerHTML = html;
+  } catch(e) {
+    // silently ignore polling errors
+  }
+}
+
+// ── UI: messages ──────────────────────────────────────────────────────────────
+function add_message(role, content, opts = {}) {
+  const msg = { role, content, ts: new Date().toISOString(), id: Math.random().toString(36).slice(2) };
+  state.messages.push(msg);
+  render_message(msg, opts);
+  scroll_to_bottom();
+  return msg.id;
+}
+
+function render_message(msg, opts = {}) {
+  const container = document.getElementById('messages');
+
+  // Remove welcome message on first real message
+  const welcome = container.querySelector('.welcome');
+  if (welcome) welcome.remove();
+
+  const div = document.createElement('div');
+  div.className = `msg ${msg.role}`;
+  div.id = `msg-${msg.id}`;
+
+  const role_labels = { user: 'you', agent: 'agent', skill: 'skill', system: '·', error: 'error' };
+
+  let bubble_content;
+  if (msg.role === 'agent') {
+    bubble_content = render_markdown(escape_html(msg.content));
+  } else if (msg.role === 'skill') {
+    bubble_content = escape_html(msg.content);
+  } else {
+    bubble_content = escape_html(msg.content);
+  }
+
+  div.innerHTML = `
+    <div class="msg-header">
+      <span class="msg-role">${role_labels[msg.role] || msg.role}</span>
+      <span class="msg-ts">${fmt_time(msg.ts)}</span>
+    </div>
+    <div class="msg-bubble">${bubble_content}</div>
+  `;
+
+  container.appendChild(div);
+  return div;
+}
+
+function show_thinking() {
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  div.id = 'msg-thinking';
+  div.innerHTML = `
+    <div class="msg-header">
+      <span class="msg-role">agent</span>
+    </div>
+    <div class="msg-bubble">
+      <div class="thinking-dots"><span></span><span></span><span></span></div>
+    </div>
+  `;
+  container.appendChild(div);
+  scroll_to_bottom();
+}
+
+function hide_thinking() {
+  const el = document.getElementById('msg-thinking');
+  if (el) el.remove();
+}
+
+function scroll_to_bottom() {
+  const m = document.getElementById('messages');
+  m.scrollTop = m.scrollHeight;
+}
+
+// ── chat ──────────────────────────────────────────────────────────────────────
+async function send_message() {
+  if (state.thinking) return;
+
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+
+  // Handle slash commands
+  if (text.startsWith('/')) {
+    handle_slash(text);
+    return;
+  }
+
+  add_message('user', text);
+  state.history.push({ role: 'user', content: text });
+
+  if (!state.llmReady) {
+    add_message('system', 'No LLM configured. Run agentd init to set one up.');
+    return;
+  }
+
+  state.thinking = true;
+  set_input_disabled(true);
+  show_thinking();
+
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: state.history }),
+    });
+    const data = await r.json();
+
+    hide_thinking();
+    state.thinking = false;
+    set_input_disabled(false);
+
+    if (data.error) {
+      add_message('error', data.error);
+    } else {
+      add_message('agent', data.content);
+      state.history.push({ role: 'assistant', content: data.content });
+    }
+  } catch(e) {
+    hide_thinking();
+    state.thinking = false;
+    set_input_disabled(false);
+    add_message('error', 'Request failed: ' + e.message);
+  }
+
+  input.focus();
+}
+
+function handle_slash(text) {
+  const parts = text.trim().split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  switch(cmd) {
+    case '/run':
+      if (parts.length < 2) { add_message('error', 'Usage: /run <skill-name>'); return; }
+      run_skill(parts[1]);
+      break;
+    case '/clear':
+      document.getElementById('messages').innerHTML = '';
+      state.messages = [];
+      state.history = [];
+      add_message('system', 'Chat cleared.');
+      break;
+    case '/help':
+      add_message('system', [
+        'Commands:',
+        '  /run <skill>   trigger a skill',
+        '  /clear         clear the chat',
+        '  /help          show this message',
+      ].join('\n'));
+      break;
+    default:
+      add_message('error', `Unknown command: ${text}\nType /help for available commands.`);
+  }
+}
+
+// ── run skill ─────────────────────────────────────────────────────────────────
+async function run_skill(name, btn) {
+  if (state.thinking) return;
+
+  if (btn) btn.disabled = true;
+  state.thinking = true;
+  set_input_disabled(true);
+
+  add_message('system', `Running skill: ${name}…`);
+  show_thinking();
+
+  try {
+    const r = await fetch('/api/skills/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await r.json();
+
+    hide_thinking();
+    state.thinking = false;
+    set_input_disabled(false);
+    if (btn) btn.disabled = false;
+
+    if (data.error) {
+      add_message('error', data.error);
+    } else {
+      const exitLabel = data.exit_code === 0 ? '✓' : `✗ exit ${data.exit_code}`;
+      const header = `${name}  ${exitLabel}  ${data.duration_ms}ms`;
+      const body = [data.stdout, data.stderr ? '[stderr]\n' + data.stderr : ''].filter(Boolean).join('\n').trim() || '(no output)';
+      add_message('skill', header + '\n' + body);
+    }
+  } catch(e) {
+    hide_thinking();
+    state.thinking = false;
+    set_input_disabled(false);
+    if (btn) btn.disabled = false;
+    add_message('error', 'Skill run failed: ' + e.message);
+  }
+}
+
+// ── input helpers ─────────────────────────────────────────────────────────────
+function set_input_disabled(disabled) {
+  document.getElementById('chat-input').disabled = disabled;
+  document.getElementById('send-btn').disabled = disabled;
+}
+
+// Auto-resize textarea
+document.getElementById('chat-input').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// Send on Enter (Shift+Enter = newline)
+document.getElementById('chat-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send_message();
+  }
+});
+
+document.getElementById('send-btn').addEventListener('click', send_message);
+
+// ── init ──────────────────────────────────────────────────────────────────────
+async function init() {
+  await Promise.all([load_status(), load_skills(), load_activity()]);
+  // Poll activity every 5s
+  setInterval(load_activity, 5000);
+  document.getElementById('chat-input').focus();
+}
+
+init();
+</script>
+</body>
+</html>
